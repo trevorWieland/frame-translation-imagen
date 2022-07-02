@@ -10,7 +10,7 @@ from transformers import pipeline
 from tqdm.auto import tqdm
 import datasets
 from datasets import Image, load_from_disk
-
+import pandas as pd
 import numpy as np
 
 BASE_MODEL = "google/t5-v1_1-base"
@@ -43,24 +43,24 @@ def tokenize_data(base_model: str, train_dataset: datasets.Dataset):
         return tokens
 
     print("Tokenizing + Embedding Dataset in preparation for training...")
-    tokenized_dataset = train_dataset.map(tokenize_function, batched=True, batch_size=1024, num_proc=8)
+    tokenized_dataset = train_dataset.map(tokenize_function, batched=True, batch_size=1024, num_proc=16)
 
     return tokenized_dataset
 
 def pixelize_image(tokenized_dataset: datasets.Dataset):
 
     def pixelize_function(examples):
-        ims = np.array([
-            np.moveaxis(np.asarray(image.convert("RGB").resize((256,256))), -1, 0)
+        ims = [
+            image.convert("RGB").resize((256,256))
             for image
             in examples["image_path"]
-        ])
+        ]
         examples["image"] = ims
 
         return examples
 
     print("Pixelizing image data in preparation for training...")
-    pixelized_dataset = tokenized_dataset.map(pixelize_function, batched=True, batch_size=1024, num_proc=8)
+    pixelized_dataset = tokenized_dataset.map(pixelize_function, batched=True, batch_size=1024, num_proc=16)
 
     return pixelized_dataset
 
@@ -100,6 +100,8 @@ def load_or_create_data(data_path: str, force_new: bool, use_full: bool = False)
         ds["test"] = ds["test"].cast_column('image_path', Image(decode=True))
         ds["validation"] = ds["validation"].cast_column('image_path', Image(decode=True))
 
+        ds = pixelize_image(ds)
+
         ds = tokenize_data(BASE_MODEL, ds)
 
         train_embeddings = embed_dataset(BASE_MODEL, ds, "train")
@@ -109,10 +111,6 @@ def load_or_create_data(data_path: str, force_new: bool, use_full: bool = False)
         ds["train"] = datasets.concatenate_datasets([ds["train"], train_embeddings], axis=1)
         ds["test"] = datasets.concatenate_datasets([ds["test"], test_embeddings], axis=1)
         ds["validation"] = datasets.concatenate_datasets([ds["validation"], val_embeddings], axis=1)
-
-        ds = pixelize_image(ds)
-
-        #ds.save_to_disk(data_path)
 
     return ds
 
@@ -157,7 +155,9 @@ def collator(data):
     out_data["attention_mask"] = torch.tensor(np.array([np.array(d["attention_mask"]) for d in data])).type(torch.LongTensor)
 
     #Image
-    out_data["image"] = torch.tensor(np.array([np.array(d["image"]) for d in data])).type(torch.FloatTensor)
+    out_data["image"] = torch.tensor(np.array([
+        np.moveaxis(np.array(d["image"]), -1, 0) for d in data
+    ])).type(torch.FloatTensor)
 
     #Embedding
     out_data["embeddings"] = torch.tensor(np.array([np.array(d["embeddings"]) for d in data])).type(torch.FloatTensor)
@@ -170,14 +170,18 @@ def train_imagen(use_full: bool = False, force_reload: bool = True, batch_size: 
     trainer = load_imagen_models()
 
     ds["train"].set_format(columns=['embeddings', 'attention_mask', 'image'])
-    dataloader = torch.utils.data.DataLoader(ds["train"], batch_size=batch_size, collate_fn=collator)
+    train_dataloader = torch.utils.data.DataLoader(ds["train"], batch_size=batch_size, collate_fn=collator)
+    val_dataloader = torch.utils.data.DataLoader(ds["validation"], batch_size=batch_size, collate_fn=collator)
 
-    pbar = tqdm(total=epochs*(len(dataloader)))
+    pbar = tqdm(total=epochs*(len(train_dataloader)))
 
+    train_losses = [np.nan]
+    val_losses = []
     for e in range(epochs):
-        desc = f"EPOCH {e+1}/{epochs}"
-        pbar.set_description(desc)
-        for i, batch in enumerate(dataloader):
+        #Training Loop
+        for i, batch in enumerate(train_dataloader):
+            desc = f"EPOCH:{e+1}/{epochs} | LOSS: {train_losses[-1]}"
+            pbar.set_description(desc)
 
             for u in (1, 2):
                 loss = trainer(
@@ -187,11 +191,32 @@ def train_imagen(use_full: bool = False, force_reload: bool = True, batch_size: 
                     unet_number=u
                 )
                 trainer.update(unet_number = u)
+                train_losses.append(loss)
 
             pbar.update(1)
+
+        #Validation Loop
+        for i, batch in enumerate(val_dataloader):
+            desc = f"EPOCH:{e+1}/{epochs} | LOSS: {train_losses[-1]} | Evaluating..."
+            pbar.set_description(desc)
+
+            for u in (1, 2):
+                loss = trainer(
+                    batch["image"].cuda(),
+                    text_embeds=batch["embeddings"].cuda(),
+                    text_masks=batch["attention_mask"].bool().cuda(),
+                    unet_number=u
+                )
+                val_losses.append(loss)
+
     pbar.close()
 
     trainer.save("models/short_model")
+    train_df = pd.DataFrame(data=train_losses[1:], columns=["TRAIN_LOSS"])
+    val_df = pd.DataFrame(data=val_losses, columns=["VAL_LOSS"])
+
+    train_df.to_csv("training_loss.csv")
+    val_df.to_csv("validation_loss.csv")
 
 if __name__ == "__main__":
     train_imagen(force_reload=True, use_full=True, epochs=1)
